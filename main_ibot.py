@@ -28,6 +28,12 @@ from tensorboardX import SummaryWriter
 from models.head import iBOTHead
 from loader import ImageFolderMask
 from evaluation.unsupervised.unsup_cls import eval_pred
+from loader import DictTransform, GenerateMaskedBox
+
+from das.data.data_args import DataArguments
+from das.data.data_modules.factory import DataModuleFactory
+from das.utils.arg_parser import DASArgumentParser
+from das.utils.basic_args import BasicArguments
 
 def get_args_parser():
     parser = argparse.ArgumentParser('iBOT', add_help=False)
@@ -38,6 +44,9 @@ def get_args_parser():
                  'swin_tiny','swin_small', 'swin_base', 'swin_large'],
         help="""Name of architecture to train. For quick experiments with ViTs,
         we recommend using vit_tiny or vit_small.""")
+    parser.add_argument('--input_size', default='224', type=str,
+        choices=['224', '384'],
+        help="""Input resolution of the image.""")
     parser.add_argument('--patch_size', default=16, type=int, help="""Size in pixels
         of input square patches - default 16 (for 16x16 patches). Using smaller
         values leads to better performance but requires more memory. Applies only
@@ -150,6 +159,57 @@ def get_args_parser():
     parser.add_argument("--local_rank", default=0, type=int, help="Please ignore and do not set this argument.")
     return parser
 
+def get_tobacco3482(is_train=False, size='224'):
+    """
+    Parses script arguments.
+    """
+
+    # initialize the argument parsers
+    arg_parser = DASArgumentParser([BasicArguments, DataArguments])
+
+    # parse arguments either based on a json file or directly
+    basic_args, data_args = arg_parser.parse_yaml_file(
+        os.path.abspath(f'./cfg/tobacco3482_{size}.yaml')
+    )
+
+    # initialize data-handling module
+    datamodule = DataModuleFactory.create_datamodule(
+        basic_args, data_args, collate_fns=None
+    )
+    datamodule.prepare_data()
+    datamodule.setup()
+
+    if is_train:
+        return datamodule.train_dataset
+    else:
+        return datamodule.test_dataset
+
+
+def get_rvlcdip(is_train=False, size='224'):
+    """
+    Parses script arguments.
+    """
+
+    # initialize the argument parsers
+    arg_parser = DASArgumentParser([BasicArguments, DataArguments])
+
+    # parse arguments either based on a json file or directly
+    basic_args, data_args = arg_parser.parse_yaml_file(
+        os.path.abspath(f'./cfg/rvlcdip_{size}.yaml')
+    )
+
+    # initialize data-handling module
+    datamodule = DataModuleFactory.create_datamodule(
+        basic_args, data_args, collate_fns=None
+    )
+    datamodule.prepare_data()
+    datamodule.setup()
+
+    if is_train:
+        return datamodule.train_dataset
+    else:
+        return datamodule.test_dataset
+
 def train_ibot(args):
     utils.init_distributed_mode(args)
     utils.fix_random_seeds(args.seed)
@@ -165,15 +225,22 @@ def train_ibot(args):
         args.local_crops_number,
     )
     pred_size = args.patch_size * 8 if 'swin' in args.arch else args.patch_size
-    dataset = ImageFolderMask(
-        args.data_path, 
-        transform=transform,
-        patch_size=pred_size,
-        pred_ratio=args.pred_ratio,
-        pred_ratio_var=args.pred_ratio_var,
-        pred_aspect_ratio=(0.3, 1/0.3),
-        pred_shape=args.pred_shape,
-        pred_start_epoch=args.pred_start_epoch)
+
+    masked_transform = [
+        DictTransform(['image'], transform),
+        DictTransform(['image'], GenerateMaskedBox(
+            patch_size=pred_size,
+            pred_ratio=args.pred_ratio,
+            pred_ratio_var=args.pred_ratio_var,
+            pred_aspect_ratio=(0.3, 1/0.3),
+            pred_shape=args.pred_shape,
+            pred_start_epoch=args.pred_start_epoch
+        )),
+    ]
+
+    dataset = get_rvlcdip(is_train=False, size=args.input_size)
+    dataset.transforms = masked_transform
+
     sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
     data_loader = torch.utils.data.DataLoader(
         dataset,
@@ -337,7 +404,8 @@ def train_ibot(args):
     print("Starting iBOT training!")
     for epoch in range(start_epoch, args.epochs):
         data_loader.sampler.set_epoch(epoch)
-        data_loader.dataset.set_epoch(epoch)
+        # data_loader.dataset.set_epoch(epoch)
+        data_loader.dataset.transforms[1].transform.set_epoch(0)
 
         # ============ training one epoch of iBOT ... ============
         train_stats = train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss,
@@ -377,7 +445,10 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Epoch: [{}/{}]'.format(epoch, args.epochs)
     real_labels, pred_labels = [], []
-    for it, (images, labels, masks) in enumerate(metric_logger.log_every(data_loader, 10, header)):
+    for it, data in enumerate(metric_logger.log_every(data_loader, 10, header)):
+        images, masks = data['image']
+        labels = data['label']
+        
         # update weight decay and learning rate according to their schedule
         it = len(data_loader) * epoch + it  # global training iteration
         for i, param_group in enumerate(optimizer.param_groups):
@@ -586,6 +657,7 @@ class DataAugmentationiBOT(object):
         self.global_crops_number = global_crops_number
         # transformation for the first global crop
         self.global_transfo1 = transforms.Compose([
+            transforms.ToPILImage(),
             transforms.RandomResizedCrop(224, scale=global_crops_scale, interpolation=Image.BICUBIC),
             flip_and_color_jitter,
             utils.GaussianBlur(1.0),
@@ -593,6 +665,7 @@ class DataAugmentationiBOT(object):
         ])
         # transformation for the rest of global crops
         self.global_transfo2 = transforms.Compose([
+            transforms.ToPILImage(),
             transforms.RandomResizedCrop(224, scale=global_crops_scale, interpolation=Image.BICUBIC),
             flip_and_color_jitter,
             utils.GaussianBlur(0.1),
@@ -602,6 +675,7 @@ class DataAugmentationiBOT(object):
         # transformation for the local crops
         self.local_crops_number = local_crops_number
         self.local_transfo = transforms.Compose([
+            transforms.ToPILImage(),
             transforms.RandomResizedCrop(96, scale=local_crops_scale, interpolation=Image.BICUBIC),
             flip_and_color_jitter,
             utils.GaussianBlur(p=0.5),
